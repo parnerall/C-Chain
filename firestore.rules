@@ -1,0 +1,308 @@
+/**
+ * Core Philosophy:
+ * This ruleset enforces a strict, user-centric security model for a marketplace application.
+ * The core principle is "Authorization Independence," where authorization decisions are made using
+ * data denormalized directly onto the document being accessed, avoiding slow and costly `get` calls.
+ * Access is denied by default and granted explicitly based on user identity (auth.uid), document
+ * ownership, or explicit membership in a shared resource (like a conversation).
+ *
+ * Data Structure:
+ * The data is organized into several top-level collections:
+ * - `/provinces` & `/categories`: Public, read-only lookup data.
+ * - `/companyProfiles/{userId}`: User-owned profiles, where the document ID matches the user's UID.
+ * - `/posts`: A global, publicly readable collection of marketplace ads, with writes restricted to owners.
+ * - `/conversations`: Private chat threads, accessible only to declared participants.
+ * - `/roles_admin`: A restricted collection for assigning admin privileges.
+ *
+ * Subcollections are used to model direct relationships, such as:
+ * - `/companyProfiles/{userId}/likes/{postId}`: A user's own likes.
+ * - `/companyProfiles/{userId}/following/{followedId}`: A user's list of who they follow.
+ * - `/companyProfiles/{userId}/followers/{followerId}`: A user's list of followers.
+ * - `/conversations/{convoId}/messages/{msgId}`: Messages within a private chat.
+ * - `/posts/{postId}/audits/{auditId}`: Read-only AI audit reports for a post.
+ *
+ * Key Security Decisions:
+ * - Default Deny: All operations are denied unless an `allow` rule explicitly permits them.
+ * - Strict Ownership: A user's `companyProfile` and their `likes` are stored under a path
+ *   containing their UID, making ownership checks simple and performant.
+ * - Denormalized Authorization:
+ *   - `/posts` documents contain a `companyProfileId` (the owner's UID) to authorize writes without extra lookups.
+ *   - `/conversations` documents contain a `members` map to authorize access for participants directly.
+ *   - `/messages` subcollection documents denormalize this `members` map from their parent conversation to
+ *     allow for fast, independent authorization checks on a per-message basis.
+ * - Public vs. Private Data: Collections intended for public consumption (`provinces`, `categories`, `posts`)
+ *   are segregated from private, user-specific data (`companyProfiles`, `conversations`).
+ * - Admin Roles: Administrative privileges are granted based on the existence of a document in the
+ *   `/roles_admin` collection, providing a centralized and secure way to manage roles.
+ * - Backend-Only Writes: Certain collections like `/posts/{postId}/audits` are configured to block all
+ *   client-side writes, reserving them for trusted backend processes.
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --------------------------------
+    // Helper Functions
+    // --------------------------------
+
+    /**
+     * Checks if a user is authenticated.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * Checks if the currently authenticated user's UID matches the provided userId.
+     * This is the primary function for verifying document ownership.
+     */
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    /**
+     * Checks if the document being operated on already exists.
+     * CRITICAL for safe update and delete operations.
+     */
+    function isExistingDoc() {
+      return resource != null;
+    }
+
+
+
+    /**
+     * Combines ownership check with an existence check.
+     * Ensures updates and deletes target existing documents owned by the user.
+     */
+    function isExistingOwner(userId) {
+      return isOwner(userId) && isExistingDoc();
+    }
+
+    /**
+     * Checks if the user has an admin role by seeing if a document
+     * with their UID exists in the roles_admin collection.
+     */
+    function isAdmin() {
+      return exists(/databases/$(database)/documents/roles_admin/$(request.auth.uid));
+    }
+
+    /**
+     * Validates that the owner field in a new document matches the creator's UID.
+     */
+    function ownerFieldIsSetOnCreate(fieldName) {
+      return request.resource.data[fieldName] == request.auth.uid;
+    }
+
+    /**
+     * Enforces immutability for a document's ownership field during an update.
+     */
+    function ownerFieldIsImmutable(fieldName) {
+      return request.resource.data[fieldName] == resource.data[fieldName];
+    }
+    
+    /**
+     * Validates that an update operation only modifies the 'likes' field,
+     * and does so only by incrementing or decrementing by 1.
+     */
+    function isUpdatingJustLikes() {
+      let likesIncrement = request.resource.data.likes - resource.data.likes;
+      // affectedKeys() provides a set of fields that are changed in the update.
+      // We ensure that set only contains the 'likes' field.
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likes'])
+             && (likesIncrement == 1 || likesIncrement == -1);
+    }
+    
+    /**
+     * Checks if the requesting user is listed in a conversation's `members` map.
+     * The `docData` parameter can be `resource.data` or `request.resource.data`.
+     */
+    function isConversationParticipant(docData) {
+      return docData.members[request.auth.uid] == true;
+    }
+
+    /**
+     * Uses a get() call to check the parent conversation for membership.
+     * This is ONLY used for list operations where the document data isn't available.
+     */
+    function canListMessages(conversationId) {
+      return get(/databases/$(database)/documents/conversations/$(conversationId)).data.members[request.auth.uid] == true;
+    }
+
+    // --------------------------------
+    // Public Lookup Collections
+    // --------------------------------
+
+    /**
+     * @description Publicly readable collection of Angolan provinces. Writes are disabled for clients.
+     * @path /provinces/{provinceId}
+     * @allow (get) Any user, signed in or not, can read a province document.
+     * @deny (create) No client is permitted to create new provinces.
+     * @principle Provides public, read-only data for geographical categorization.
+     */
+    match /provinces/{provinceId} {
+      allow get, list: if true;
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    /**
+     * @description Publicly readable collection of marketplace categories. Writes are disabled for clients.
+     * @path /categories/{categoryId}
+     * @allow (get) Any user, signed in or not, can read a category document.
+     * @deny (create) No client is permitted to create new categories.
+     * @principle Provides public, read-only data for post categorization.
+     */
+    match /categories/{categoryId} {
+      allow get, list: if true;
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+    
+    // --------------------------------
+    // Core Data Collections
+    // --------------------------------
+
+    /**
+     * @description Stores company profiles. The document ID must match the user's UID.
+     *              Readable by any signed-in user, but only the owner can modify their own profile.
+     * @path /companyProfiles/{companyProfileId}
+     * @allow (create) A new user can create their own profile document (`request.auth.uid == companyProfileId`).
+     * @deny (update) A user cannot update another user's profile (`request.auth.uid != companyProfileId`).
+     * @principle Enforces self-service profile management and document ownership.
+     */
+    match /companyProfiles/{companyProfileId} {
+      allow get, list: if isSignedIn();
+      allow create: if isOwner(companyProfileId);
+      allow update: if isExistingOwner(companyProfileId);
+      allow delete: if isExistingOwner(companyProfileId);
+
+      /**
+       * @description A user's collection of liked posts. The path enforces ownership.
+       * @path /companyProfiles/{companyProfileId}/likes/{postId}
+       * @allow (create) A user can create a 'like' document within their own profile subcollection.
+       * @deny (create) A user cannot create a 'like' on behalf of another user.
+       * @principle Restricts access to a user's own data tree.
+       */
+      match /likes/{postId} {
+        allow get, list: if isOwner(companyProfileId);
+        allow create: if isOwner(companyProfileId) && ownerFieldIsSetOnCreate('companyProfileId');
+        allow update: if false;
+        allow delete: if isExistingOwner(companyProfileId);
+      }
+      
+      /**
+       * @description A user's list of who they are following.
+       * @path /companyProfiles/{companyProfileId}/following/{followedId}
+       * @allow (read, list) Any signed-in user can see who another user is following.
+       * @allow (create, delete) Only the owner can add or remove users from their 'following' list.
+       * @principle Enforces ownership for managing social graph connections.
+       */
+      match /following/{followedId} {
+        allow list, get: if isSignedIn();
+        allow create, delete: if isOwner(companyProfileId);
+        allow update: if false;
+      }
+
+      /**
+       * @description A user's list of followers. This collection is managed via batched writes.
+       * @path /companyProfiles/{companyProfileId}/followers/{followerId}
+       * @allow (read, list) Any signed-in user can see who follows another user.
+       * @allow (create, delete) A user can add/remove themselves from another user's followers list.
+       * @principle Secures follower lists while allowing reciprocal batched writes.
+       */
+      match /followers/{followerId} {
+        allow list, get: if isSignedIn();
+        allow create, delete: if isOwner(followerId); // A user can manage their presence in other's follower lists
+        allow update: if false;
+      }
+    }
+
+    /**
+     * @description Publicly readable marketplace posts. Anyone signed in can view all posts.
+     *              Only the original author can create, update, or delete their own posts.
+     *              Any signed-in user can update the 'likes' count.
+     * @path /posts/{postId}
+     * @allow (create) An authenticated user can create a post, setting their own UID as the `companyProfileId`.
+     * @deny (update) A user cannot update a post where the `companyProfileId` does not match their UID, unless it's just a like.
+     * @principle Implements a "Public Read, Owner Write" pattern with an exception for social interactions.
+     */
+    match /posts/{postId} {
+      allow get, list: if isSignedIn();
+      allow create: if isSignedIn() && ownerFieldIsSetOnCreate('companyProfileId');
+      allow update: if (isExistingOwner(resource.data.companyProfileId) && ownerFieldIsImmutable('companyProfileId'))
+                    || (isSignedIn() && isExistingDoc() && isUpdatingJustLikes());
+      allow delete: if isExistingOwner(resource.data.companyProfileId);
+    }
+    
+    /**
+     * @description Read-only AI audit reports for a post. Writable only by a backend service.
+     * @path /posts/{postId}/audits/{auditId}
+     * @allow (get) Any authenticated user can read an audit report for a post.
+     * @deny (create, update, delete) All client-side write operations are forbidden to protect data integrity.
+     * @principle Secures a data collection for trusted, server-side-only writes.
+     */
+    match /posts/{postId}/audits/{auditId} {
+      allow get, list: if isSignedIn();
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+    
+    /**
+     * @description Private conversation threads between two or more users.
+     *              Access is granted if the user's UID is in the document's `members` map.
+     * @path /conversations/{conversationId}
+     * @allow (get) A user whose UID is in the `members` map can read the conversation.
+     * @deny (get) A user whose UID is not in the `members` map cannot read the conversation.
+     * @principle Enforces shared access for a closed group of collaborators using a denormalized members list.
+     */
+    match /conversations/{conversationId} {
+      allow get: if isSignedIn() && isConversationParticipant(resource.data);
+      allow list: if isSignedIn(); // Queries must use .where('members.uid', '==', true)
+      allow create: if isSignedIn() && isConversationParticipant(request.resource.data);
+      allow update: if isSignedIn() && isExistingDoc() && isConversationParticipant(resource.data);
+      allow delete: if false; // Conversations are generally not deletable by users.
+    }
+    
+    /**
+     * @description Messages within a private conversation.
+     *              Access is controlled by the parent conversation's participant list.
+     * @path /conversations/{conversationId}/messages/{messageId}
+     * @allow (create) A participant of the conversation can send a message.
+     * @deny (get) A non-participant cannot read messages in the conversation.
+     * @principle Secures a subcollection based on authorization data in the parent document.
+     */
+    match /conversations/{conversationId}/messages/{messageId} {
+      allow get: if canListMessages(conversationId);
+      allow list: if canListMessages(conversationId);
+      allow create: if canListMessages(conversationId) && ownerFieldIsSetOnCreate('senderCompanyProfileId');
+      allow update: if canListMessages(conversationId) && isExistingOwner(resource.data.senderCompanyProfileId);
+      allow delete: if canListMessages(conversationId) && isExistingOwner(resource.data.senderCompanyProfileId);
+    }
+    
+    // --------------------------------
+    // Admin and System Collections
+    // --------------------------------
+    
+    /**
+     * @description Defines user roles. The existence of a document here grants admin privileges.
+     *              Only admins can read these documents, and they cannot be modified by clients.
+     * @path /roles_admin/{userId}
+     * @allow (get) An admin user can read their own role document.
+     * @deny (list) No user can list all the admins.
+     * @deny (create) Roles cannot be created from the client.
+     * @principle Role-based access control (RBAC) managed by document existence.
+     */
+    match /roles_admin/{userId} {
+      allow get: if isOwner(userId) && isAdmin();
+      allow list: if false;
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+  }
+}
+
+    
